@@ -36,6 +36,12 @@ async function proxyVideo(req, res) {
             ...getMediaHeaders(referer, origin),
             'Accept': isM3u8 ? '*/*' : 'video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5'
         };
+        if (req.headers['x-forwarded-for']) {
+            reqHeaders['X-Forwarded-For'] = req.headers['x-forwarded-for'];
+        }
+        if (req.headers['x-real-ip']) {
+            reqHeaders['X-Real-IP'] = req.headers['x-real-ip'];
+        }
         if (req.headers.range)
             reqHeaders['Range'] = req.headers.range;
         // AXIOS REQUEST

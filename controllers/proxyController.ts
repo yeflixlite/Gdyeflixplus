@@ -41,6 +41,13 @@ async function proxyVideo(req: Request, res: Response): Promise<any> {
       'Accept': isM3u8 ? '*/*' : 'video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5'
     };
 
+    if (req.headers['x-forwarded-for']) {
+        reqHeaders['X-Forwarded-For'] = req.headers['x-forwarded-for'] as string;
+    }
+    if (req.headers['x-real-ip']) {
+        reqHeaders['X-Real-IP'] = req.headers['x-real-ip'] as string;
+    }
+
     if (req.headers.range) reqHeaders['Range'] = req.headers.range as string;
 
     // AXIOS REQUEST
