@@ -89,14 +89,27 @@ async function proxyVideo(req: Request, res: Response): Promise<any> {
         // Rewrite HLS (.m3u8)
         body = body.split('\n').map(line => {
           const trimmed = line.trim();
-          if (trimmed.startsWith('#') || trimmed === '') return line;
+          if (trimmed === '') return line;
 
-          let absoluteUrl = trimmed;
-          if (!trimmed.startsWith('http')) {
-             const basePath = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-             absoluteUrl = trimmed.startsWith('/') ? new URL(targetUrl).origin + trimmed : basePath + trimmed;
+          // Extraer lógica para hacer las URLs absolutas
+          const makeAbsolute = (uri: string) => {
+            if (uri.startsWith('http')) return uri;
+            const basePath = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+            return uri.startsWith('/') ? new URL(targetUrl).origin + uri : basePath + uri;
+          };
+
+          // Reescribir URI="..." dentro de las etiquetas #EXT (ej. #EXT-X-MEDIA para audios)
+          if (trimmed.startsWith('#')) {
+            if (trimmed.includes('URI="')) {
+              return trimmed.replace(/URI="(.*?)"/gi, (match, uri) => {
+                return `URI="${proxyBase}${encodeURIComponent(makeAbsolute(uri))}"`;
+              });
+            }
+            return line;
           }
-          return `${proxyBase}${encodeURIComponent(absoluteUrl)}`;
+
+          // Reescribir las URLs de los segmentos o sub-playlists
+          return `${proxyBase}${encodeURIComponent(makeAbsolute(trimmed))}`;
         }).join('\n');
 
         // Si se necesita envolver un playlist single-level en un master sintético
