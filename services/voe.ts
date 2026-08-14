@@ -23,6 +23,7 @@ const CACHE_TTL = 1000 * 60 * 60;
 
 /* ── Dominios reconocidos de VOE ────────── */
 const VOE_DOMAINS: string[] = [
+    'nicolehappyoutside.com',
     'voe.sx',
     'charlestoughrace.com',
     'reitshof.com',
@@ -91,6 +92,7 @@ async function extract(url: string): Promise<ExtractResult> {
 
     // Espejos limpios de VOE y nuevos dominios detectados
     const CLEAN_MIRRORS = [
+        'nicolehappyoutside.com',
         'timmaybealready.com',
         'charlestoughrace.com',
         'reitshof.com',
