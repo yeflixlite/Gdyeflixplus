@@ -69,9 +69,14 @@ async function getPlayUrl(req, res) {
         const host = req.get('host');
         const proto = req.headers['x-forwarded-proto'] || req.protocol;
         // Generar la URL final del proxy
-        const proxyUrl = `${proto}://${host}/proxy?url=${encodeURIComponent(result.videoUrl)}` +
+        let proxyUrl = `${proto}://${host}/proxy?url=${encodeURIComponent(result.videoUrl)}` +
             `&referer=${encodeURIComponent(result.referer || '')}` +
             (result.wrapLevel ? `&wrap=${result.wrapLevel}` : '');
+        // Para VOE: pasar la URL original del embed para que el proxy pueda
+        // re-extraer en el mismo proceso (misma IP) si el CDN devuelve 403 (IP binding)
+        if (provider === 'voe') {
+            proxyUrl += `&embed_url=${encodeURIComponent(url)}`;
+        }
         const response = {
             videoUrl: result.videoUrl,
             proxyUrl,

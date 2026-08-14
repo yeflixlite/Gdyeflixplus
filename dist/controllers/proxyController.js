@@ -27,6 +27,7 @@ async function proxyVideo(req, res) {
     const referer = req.query.referer || '';
     const isDash = req.query.type === 'dash';
     const wrapLevel = req.query.wrap;
+    const embedUrl = req.query.embed_url || ''; // Para re-extracción VOE en caso de 403
     if (!targetUrl)
         return res.status(400).send('Error: Falta URL');
     try {
@@ -72,20 +73,56 @@ async function proxyVideo(req, res) {
         // HLS / M3U8 PROCESSING
         if (isM3u8) {
             let body = response.data;
-            // VALIDAR que la respuesta sea realmente M3U8 y no una página HTML de error (ej: 403 Forbidden)
+            // Validar que la respuesta sea M3U8 real (no una página HTML de error 403)
             const isValidM3u8 = typeof body === 'string' && (body.trimStart().startsWith('#EXTM3U') ||
                 body.includes('#EXT-X-') ||
                 body.includes('#EXTINF'));
-            if (!isValidM3u8) {
+            // Si la validación falla, intentar re-extracción para VOE
+            if (!isValidM3u8 && isVoe && embedUrl) {
+                console.log(`[Proxy] VOE 403 detectado. Re-extrayendo desde: ${embedUrl}`);
+                try {
+                    const voe = require('../services/voe');
+                    const freshResult = await voe.extract(embedUrl);
+                    // Reintentar con la URL fresca (misma IP de esta función)
+                    const freshResponse = await (0, axios_1.default)({
+                        method: 'GET',
+                        url: freshResult.videoUrl,
+                        headers: reqHeaders,
+                        responseType: 'text',
+                        maxRedirects: 5,
+                        validateStatus: () => true,
+                        httpAgent,
+                        httpsAgent,
+                    });
+                    body = freshResponse.data;
+                    const isNowValid = typeof body === 'string' && (body.trimStart().startsWith('#EXTM3U') ||
+                        body.includes('#EXT-X-') ||
+                        body.includes('#EXTINF'));
+                    if (!isNowValid) {
+                        console.error(`[Proxy] Re-extracción VOE también falló (status=${freshResponse.status})`);
+                        res.set('Content-Type', 'application/json');
+                        return res.status(freshResponse.status || 403).json({ error: 'VOE: El CDN sigue rechazando la solicitud tras re-extraer.' });
+                    }
+                    console.log('[Proxy] VOE re-extracción exitosa.');
+                }
+                catch (reExtractErr) {
+                    console.error('[Proxy] Error en re-extracción VOE:', reExtractErr.message);
+                    res.set('Content-Type', 'application/json');
+                    return res.status(503).json({ error: 'VOE: No se pudo re-extraer el enlace.' });
+                }
+            }
+            else if (!isValidM3u8) {
                 const statusCode = response.status !== 200 ? response.status : 403;
                 console.error(`[Proxy] Respuesta no-M3U8 (status=${response.status}) para: ${targetUrl.substring(0, 80)}`);
                 res.set('Content-Type', 'application/json');
                 return res.status(statusCode).json({ error: `El CDN devolvió un error (${statusCode}) en lugar del playlist M3U8.` });
             }
-            res.status(response.status);
+            res.status(200);
             const host = req.get('host');
             const proto = req.headers['x-forwarded-proto'] || req.protocol;
-            const proxyBase = `${proto}://${host}/proxy?referer=${encodeURIComponent(referer)}&url=`;
+            // Incluir embed_url en el proxyBase para que las sub-playlists puedan re-extraer también
+            const embedParam = embedUrl ? `&embed_url=${encodeURIComponent(embedUrl)}` : '';
+            const proxyBase = `${proto}://${host}/proxy?referer=${encodeURIComponent(referer)}${embedParam}&url=`;
             if (isDash) {
                 // Rewrite DASH (.mpd)
                 body = body.replace(/(<BaseURL>)(.*?)(<\/BaseURL>)/gi, (match, p1, p2, p3) => {
