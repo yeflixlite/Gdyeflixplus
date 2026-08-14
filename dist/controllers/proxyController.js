@@ -37,8 +37,8 @@ async function proxyVideo(req, res) {
             'Accept': isM3u8 ? '*/*' : 'video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5'
         };
         // Detectar proveedor basado en la URL
-        const isVoe = targetUrl.includes('voe') || targetUrl.includes('ugc-cdn-caching') || targetUrl.includes('cloudwindow-route');
-        const isStreamwish = targetUrl.includes('streamwish') || targetUrl.includes('premilkyway');
+        const isVoe = targetUrl.includes('voe') || targetUrl.includes('ugc-cdn-caching') || targetUrl.includes('cloudwindow-route') || targetUrl.includes('hls2-c');
+        const isStreamwish = targetUrl.includes('streamwish') || targetUrl.includes('premilkyway') || targetUrl.includes('goldenfieldcreativeworks');
         // SOLO enviar X-Forwarded-For en Streamwish para evitar el rate-limit de IP dual.
         // En VOE estropea la comprobación de IP y causa 403.
         if (isStreamwish) {
@@ -69,10 +69,20 @@ async function proxyVideo(req, res) {
                 res.set(h, response.headers[h]);
         });
         res.set('Access-Control-Allow-Origin', '*');
-        res.status(response.status);
         // HLS / M3U8 PROCESSING
         if (isM3u8) {
             let body = response.data;
+            // VALIDAR que la respuesta sea realmente M3U8 y no una página HTML de error (ej: 403 Forbidden)
+            const isValidM3u8 = typeof body === 'string' && (body.trimStart().startsWith('#EXTM3U') ||
+                body.includes('#EXT-X-') ||
+                body.includes('#EXTINF'));
+            if (!isValidM3u8) {
+                const statusCode = response.status !== 200 ? response.status : 403;
+                console.error(`[Proxy] Respuesta no-M3U8 (status=${response.status}) para: ${targetUrl.substring(0, 80)}`);
+                res.set('Content-Type', 'application/json');
+                return res.status(statusCode).json({ error: `El CDN devolvió un error (${statusCode}) en lugar del playlist M3U8.` });
+            }
+            res.status(response.status);
             const host = req.get('host');
             const proto = req.headers['x-forwarded-proto'] || req.protocol;
             const proxyBase = `${proto}://${host}/proxy?referer=${encodeURIComponent(referer)}&url=`;
@@ -109,23 +119,25 @@ async function proxyVideo(req, res) {
                         if (trimmed.includes('URI="')) {
                             return trimmed.replace(/URI="(.*?)"/gi, (match, uri) => {
                                 const absolute = makeAbsolute(uri);
-                                if (isStreamwish && !absolute.includes('.m3u8') && !absolute.includes('.txt')) {
-                                    // Streamwish: bypass para fragmentos (evita stuttering)
-                                    return `URI="${absolute}"`;
+                                // Streamwish Y Voe: fragmentos de audio/video van directos al CDN (bypass del proxy)
+                                // Solo los sub-playlists (.m3u8/.txt) siguen pasando por el proxy
+                                if (absolute.includes('.m3u8') || absolute.includes('.txt')) {
+                                    return `URI="${proxyBase}${encodeURIComponent(absolute)}"`;
                                 }
-                                // Voe y otros: TODO pasa por proxy para mantener la comprobación de IP
-                                return `URI="${proxyBase}${encodeURIComponent(absolute)}"`;
+                                return `URI="${absolute}"`;
                             });
                         }
                         return line;
                     }
                     const absolute = makeAbsolute(trimmed);
-                    if (isStreamwish && !absolute.includes('.m3u8') && !absolute.includes('.txt')) {
-                        // Streamwish: bypass para fragmentos de video
-                        return absolute;
+                    // Si es sub-playlist, pasarlo por el proxy para el rewrite CORS
+                    if (absolute.includes('.m3u8') || absolute.includes('.txt')) {
+                        return `${proxyBase}${encodeURIComponent(absolute)}`;
                     }
-                    // Voe y otros: pasar todo por el proxy
-                    return `${proxyBase}${encodeURIComponent(absolute)}`;
+                    // Fragmentos de video/audio (.ts, .mp4): bypass directo al CDN
+                    // - Streamwish: evita stuttering por cuello de botella en Vercel
+                    // - Voe: evita 403 por IP binding en diferentes serverless functions
+                    return absolute;
                 }).join('\n');
                 // Si se necesita envolver un playlist single-level en un master sintético
                 if (wrapLevel && !body.includes('#EXT-X-STREAM-INF')) {
