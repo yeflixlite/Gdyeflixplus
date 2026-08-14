@@ -101,13 +101,24 @@ async function proxyVideo(req, res) {
                     if (trimmed.startsWith('#')) {
                         if (trimmed.includes('URI="')) {
                             return trimmed.replace(/URI="(.*?)"/gi, (match, uri) => {
-                                return `URI="${proxyBase}${encodeURIComponent(makeAbsolute(uri))}"`;
+                                const absolute = makeAbsolute(uri);
+                                // Si el URI es otro playlist (.m3u8 o .txt), lo pasamos por el proxy.
+                                // Si no, lo dejamos directo.
+                                if (absolute.includes('.m3u8') || absolute.includes('.txt')) {
+                                    return `URI="${proxyBase}${encodeURIComponent(absolute)}"`;
+                                }
+                                return `URI="${absolute}"`;
                             });
                         }
                         return line;
                     }
-                    // Reescribir las URLs de los segmentos o sub-playlists
-                    return `${proxyBase}${encodeURIComponent(makeAbsolute(trimmed))}`;
+                    const absolute = makeAbsolute(trimmed);
+                    // Si es un playlist, pasarlo por el proxy
+                    if (absolute.includes('.m3u8') || absolute.includes('.txt')) {
+                        return `${proxyBase}${encodeURIComponent(absolute)}`;
+                    }
+                    // Si es un fragmento de video (.ts, .mp4, etc), devolver URL directa para evitar cuellos de botella y cortes
+                    return absolute;
                 }).join('\n');
                 // Si se necesita envolver un playlist single-level en un master sintético
                 if (wrapLevel && !body.includes('#EXT-X-STREAM-INF')) {
