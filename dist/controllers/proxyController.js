@@ -156,25 +156,29 @@ async function proxyVideo(req, res) {
                         if (trimmed.includes('URI="')) {
                             return trimmed.replace(/URI="(.*?)"/gi, (match, uri) => {
                                 const absolute = makeAbsolute(uri);
-                                // Streamwish Y Voe: fragmentos de audio/video van directos al CDN (bypass del proxy)
-                                // Solo los sub-playlists (.m3u8/.txt) siguen pasando por el proxy
                                 if (absolute.includes('.m3u8') || absolute.includes('.txt')) {
                                     return `URI="${proxyBase}${encodeURIComponent(absolute)}"`;
                                 }
-                                return `URI="${absolute}"`;
+                                // Streamwish: sus CDN tienen CORS → bypass directo evita stuttering
+                                // Voe y otros: sus CDN NO tienen CORS → deben pasar por el proxy
+                                if (isStreamwish)
+                                    return `URI="${absolute}"`;
+                                return `URI="${proxyBase}${encodeURIComponent(absolute)}"`;
                             });
                         }
                         return line;
                     }
                     const absolute = makeAbsolute(trimmed);
-                    // Si es sub-playlist, pasarlo por el proxy para el rewrite CORS
+                    // Sub-playlists: siempre por el proxy (necesario para reescribir URLs)
                     if (absolute.includes('.m3u8') || absolute.includes('.txt')) {
                         return `${proxyBase}${encodeURIComponent(absolute)}`;
                     }
-                    // Fragmentos de video/audio (.ts, .mp4): bypass directo al CDN
-                    // - Streamwish: evita stuttering por cuello de botella en Vercel
-                    // - Voe: evita 403 por IP binding en diferentes serverless functions
-                    return absolute;
+                    // Fragmentos (.ts, .mp4, etc.)
+                    // Streamwish: CDN tiene CORS → bypass directo (velocidad máxima, sin cuello de botella)
+                    // Voe y otros: CDN sin CORS → pasar por proxy
+                    if (isStreamwish)
+                        return absolute;
+                    return `${proxyBase}${encodeURIComponent(absolute)}`;
                 }).join('\n');
                 // Si se necesita envolver un playlist single-level en un master sintético
                 if (wrapLevel && !body.includes('#EXT-X-STREAM-INF')) {
