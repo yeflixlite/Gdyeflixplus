@@ -36,11 +36,18 @@ async function proxyVideo(req, res) {
             ...getMediaHeaders(referer, origin),
             'Accept': isM3u8 ? '*/*' : 'video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5'
         };
-        if (req.headers['x-forwarded-for']) {
-            reqHeaders['X-Forwarded-For'] = req.headers['x-forwarded-for'];
-        }
-        if (req.headers['x-real-ip']) {
-            reqHeaders['X-Real-IP'] = req.headers['x-real-ip'];
+        // Detectar proveedor basado en la URL
+        const isVoe = targetUrl.includes('voe') || targetUrl.includes('ugc-cdn-caching') || targetUrl.includes('cloudwindow-route');
+        const isStreamwish = targetUrl.includes('streamwish') || targetUrl.includes('premilkyway');
+        // SOLO enviar X-Forwarded-For en Streamwish para evitar el rate-limit de IP dual.
+        // En VOE estropea la comprobación de IP y causa 403.
+        if (isStreamwish) {
+            if (req.headers['x-forwarded-for']) {
+                reqHeaders['X-Forwarded-For'] = req.headers['x-forwarded-for'];
+            }
+            if (req.headers['x-real-ip']) {
+                reqHeaders['X-Real-IP'] = req.headers['x-real-ip'];
+            }
         }
         if (req.headers.range)
             reqHeaders['Range'] = req.headers.range;
@@ -102,23 +109,23 @@ async function proxyVideo(req, res) {
                         if (trimmed.includes('URI="')) {
                             return trimmed.replace(/URI="(.*?)"/gi, (match, uri) => {
                                 const absolute = makeAbsolute(uri);
-                                // Si el URI es otro playlist (.m3u8 o .txt), lo pasamos por el proxy.
-                                // Si no, lo dejamos directo.
-                                if (absolute.includes('.m3u8') || absolute.includes('.txt')) {
-                                    return `URI="${proxyBase}${encodeURIComponent(absolute)}"`;
+                                if (isStreamwish && !absolute.includes('.m3u8') && !absolute.includes('.txt')) {
+                                    // Streamwish: bypass para fragmentos (evita stuttering)
+                                    return `URI="${absolute}"`;
                                 }
-                                return `URI="${absolute}"`;
+                                // Voe y otros: TODO pasa por proxy para mantener la comprobación de IP
+                                return `URI="${proxyBase}${encodeURIComponent(absolute)}"`;
                             });
                         }
                         return line;
                     }
                     const absolute = makeAbsolute(trimmed);
-                    // Si es un playlist, pasarlo por el proxy
-                    if (absolute.includes('.m3u8') || absolute.includes('.txt')) {
-                        return `${proxyBase}${encodeURIComponent(absolute)}`;
+                    if (isStreamwish && !absolute.includes('.m3u8') && !absolute.includes('.txt')) {
+                        // Streamwish: bypass para fragmentos de video
+                        return absolute;
                     }
-                    // Si es un fragmento de video (.ts, .mp4, etc), devolver URL directa para evitar cuellos de botella y cortes
-                    return absolute;
+                    // Voe y otros: pasar todo por el proxy
+                    return `${proxyBase}${encodeURIComponent(absolute)}`;
                 }).join('\n');
                 // Si se necesita envolver un playlist single-level en un master sintético
                 if (wrapLevel && !body.includes('#EXT-X-STREAM-INF')) {
