@@ -37,21 +37,9 @@ const CACHE_TTL = 1000 * 60 * 60;
 const STREAMWISH_DOMAINS = [
     'streamwish.com',
     'streamwish.to',
-    'embedwish.com',
-    'wishembed.net',
-    'flaswish.com',
-    'sfastwish.com',
-    'sfastwish.com',
-    'wishfast.top',
     'hgcloud.to',
     'hgcloud.net',
     'hglink.to',
-    'hglink.net',
-    'awish.pro',
-    'dwish.pro',
-    'cilootv.store',
-    'bestx.stream',
-    'moviesapi.club',
     'hglamioz.com',
     'streamhg.com',
 ];
@@ -104,7 +92,7 @@ function tryDecodeEval(js) {
     }
     // 2. Intentar P.A.C.K.E.R (Dean Edwards)
     // eval(function(p,a,c,k,e,d){...}('payload', base, count, 'dict'.split('|')))
-    const packerMatch = js.match(/eval\(function\(p,a,c,k,e,d\).*?\}\s*\(\s*['"](.*?)['"],\s*(\d+)\s*,\s*(\d+)\s*,\s*['"](.*?)['"]\.split\(['"]\|['"]\)/s);
+    const packerMatch = js.match(/eval\(function\(p,a,c,k,e,d\).*?\}\s*\(\s*['"](.*?)['"]\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*['"](.*?)['"]\.split\(['"]\|['"]\)/s);
     if (packerMatch) {
         try {
             let [, p, aStr, , k] = packerMatch;

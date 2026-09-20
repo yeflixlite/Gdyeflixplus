@@ -2,7 +2,8 @@
  * ============================================================
  *  controllers/playController.ts
  *  Endpoint: GET /play?url=...
- *  Extrae la URL del video y devuelve un objeto JSON compatible con el Player
+ *  Orquesta la detección del proveedor y llama al servicio
+ *  correcto para obtener el enlace real del video.
  * ============================================================
  */
 
@@ -12,12 +13,12 @@ import { Request, Response } from 'express';
 import { ProviderName } from '../utils/urlDetector';
 import { PlayResponse } from '../types';
 const { detectProvider } = require('../utils/urlDetector');
-const extractController  = require('./extractController');
 
 const streamwish  = require('../services/streamwish');
 const vidhide     = require('../services/vidhide');
 const filemoon    = require('../services/filemoon');
 const voe         = require('../services/voe');
+const goodstream  = require('../services/goodstream');
 const doodstream  = require('../services/doodstream');
 const streamtape  = require('../services/streamtape');
 const dailymotion = require('../services/dailymotion');
@@ -25,85 +26,126 @@ const earvids     = require('../services/earvids');
 const nupload     = require('../services/nupload');
 const generic     = require('../services/generic');
 
-// Envivos
-const espn2       = require('../services/envivos/espn2');
+// Mapa proveedor → servicio HTTP
+const HTTP_SERVICE_MAP: Record<string, any> = {
+  streamwish,
+  hgcloud     : streamwish,
+  vidhide,
+  filemoon,
+  voe,
+  goodstream,
+  doodstream,
+  streamtape,
+  dailymotion,
+  earvids,
+  nupload,
+};
 
 async function getPlayUrl(req: Request, res: Response): Promise<any> {
-  const url = req.query.url as string;
-  if (!url) {
-    return res.status(400).json({ error: 'Falta parámetro url' });
-  }
-
-  const provider: ProviderName = detectProvider(url);
-  let extractor: any;
-
-  switch (provider) {
-    case 'streamwish':
-    case 'hgcloud':
-      extractor = streamwish;
-      break;
-    case 'vidhide':
-      extractor = vidhide;
-      break;
-    case 'filemoon':
-      extractor = filemoon;
-      break;
-    case 'voe':
-      extractor = voe;
-      break;
-    case 'doodstream':
-      extractor = doodstream;
-      break;
-    case 'streamtape':
-      extractor = streamtape;
-      break;
-    case 'dailymotion':
-      extractor = dailymotion;
-      break;
-    case 'earvids':
-      extractor = earvids;
-      break;
-    case 'nupload':
-      extractor = nupload;
-      break;
-    case 'mp4upload':
-    case 'direct':
-    case 'unknown':
-    default:
-      extractor = generic;
-      break;
-  }
-
   try {
-    const result = await extractor.extract(url);
-    const host   = req.get('host');
-    const proto  = req.headers['x-forwarded-proto'] || req.protocol;
+    const { url, mode = 'auto' } = req.query as Record<string, string>;
 
-    // Generar la URL final del proxy
-    let proxyUrl = `${proto}://${host}/proxy?url=${encodeURIComponent(result.videoUrl)}` +
-                     `&referer=${encodeURIComponent(result.referer || '')}` +
-                     (result.wrapLevel ? `&wrap=${result.wrapLevel}` : '');
+    if (!url) {
+      return res.status(400).json({ error: 'Parámetro "url" requerido.' });
+    }
+
+    let decodedUrl: string;
+    try {
+      decodedUrl = decodeURIComponent(url);
+      new URL(decodedUrl);
+    } catch {
+      return res.status(400).json({ error: 'La URL proporcionada no es válida.' });
+    }
+
+    const provider: ProviderName = detectProvider(decodedUrl);
+    console.log(`\n[Play] Proveedor detectado: ${provider} → ${decodedUrl}`);
+
+    let result: any = null;
+    let method: string | null = null;
+
+    // Lógica de extracción optimizada para VELOCIDAD
+    if (mode === 'puppeteer') {
+      const puppeteerExtractor = require('../services/puppeteerExtractor');
+      result = await puppeteerExtractor.extract(decodedUrl);
+      method = 'puppeteer';
+    } else if (mode === 'http') {
+      const service = HTTP_SERVICE_MAP[provider];
+      if (!service) throw new Error(`Proveedor HTTP no soportado: ${provider}`);
+      result = await service.extract(decodedUrl);
+      method = 'http';
+    } else {
+      // MODO AUTO: Siempre intenta HTTP primero (1s) antes de ir a Puppeteer (15s)
+      try {
+        const service = HTTP_SERVICE_MAP[provider];
+        if (!service) throw new Error(`Proveedor HTTP no soportado: ${provider}`);
+        result = await service.extract(decodedUrl);
+        method = 'http';
+      } catch (err) {
+        // Si el servicio ya usa Puppeteer por dentro y falló, no tiene sentido usar el genérico
+        if (provider === 'doodstream') {
+          throw new Error(`Fallo en la extracción dedicada: ${(err as Error).message}`);
+        }
+
+        console.warn(`[Play] HTTP falló para ${provider}, intentando Puppeteer como fallback...`);
+        try {
+          const puppeteerExtractor = require('../services/puppeteerExtractor');
+          result = await puppeteerExtractor.extract(decodedUrl);
+          method = 'puppeteer';
+        } catch (puppErr) {
+          // Si falla el require de puppeteer (en Vercel por ejemplo)
+          if ((puppErr as Error).message.includes('Cannot find module')) {
+            throw new Error(`Fallo en HTTP: ${(err as Error).message}. Puppeteer no está disponible en este servidor.`);
+          }
+          throw new Error(`Fallo total. HTTP: ${(err as Error).message}. Puppeteer: ${(puppErr as Error).message}`);
+        }
+      }
+    }
+
+    // Construye la URL de proxy (relativa para evitar problemas de HTTPS/Mixed Content)
+    const encodedVideoUrl = encodeURIComponent(result.videoUrl);
+    const encodedReferer  = encodeURIComponent(result.referer || '');
+    const isHlsTxt        = /\.txt(\?|$)/i.test(result.videoUrl);
+    // wrapLevel: cuando el servicio indica que el m3u8 es single-level (sin #EXT-X-STREAM-INF)
+    // el proxy generará un master sintético con la calidad indicada (ej. "720p")
+    const wrapParam       = result.wrapLevel ? `&wrapM3u8=${encodeURIComponent(result.wrapLevel)}` : '';
+
+    let proxyUrl = `/proxy?url=${encodedVideoUrl}&referer=${encodedReferer}${isHlsTxt ? '&forceM3u8=1' : ''}${wrapParam}`;
 
     // Para VOE: pasar la URL original del embed para que el proxy pueda
     // re-extraer en el mismo proceso (misma IP) si el CDN devuelve 403 (IP binding)
     if (provider === 'voe') {
-        proxyUrl += `&embed_url=${encodeURIComponent(url)}`;
+      proxyUrl += `&embed_url=${encodeURIComponent(decodedUrl)}`;
     }
 
+    // ÓPTIMO DE BANDA (StreamWish / VidHide / Filemoon): el proveedor ya
+    // entrega un HLS/m3u8 completo y reproducible, así que el reproductor puede
+    // consumir ese HLS DIRECTAMENTE desde el CDN del proveedor (sus segmentos NO
+    // pasan por el servidor, Data Transfer ≈ 0). El proxy solo se usa como respaldo.
+    //
+    // VOE excluido (16/09/2026): su CDN *.cloudwindow-route.com ya NO responde
+    // Access-Control-Allow-Origin desde el navegador y los tokens quedan ligados
+    // a la IP del servidor → 403/CORS en directo. Todo el tráfico VOE pasa por
+    // /proxy (con hot-swap en caso de 403).
+    const directPlay =
+      (provider === 'streamwish' || provider === 'hgcloud' ||
+       provider === 'vidhide'    || provider === 'filemoon') &&
+      result.type === 'm3u8';
+
     const response: PlayResponse = {
-      videoUrl: result.videoUrl,
+      videoUrl : result.videoUrl,
       proxyUrl,
-      type:     result.type,
+      directPlay,
+      type     : result.type,
       provider,
-      method:   result.method || null
+      method,
     };
 
-    res.json(response);
+    return res.json(response);
 
-  } catch (error) {
-    console.error(`[PlayController] Error extrayendo ${url}:`, (error as Error).message);
-    res.status(500).json({ error: (error as Error).message });
+  } catch (err) {
+    console.error('[Play Error]', (err as Error).message);
+    return res.status(500).json({ error: (err as Error).message });
   }
 }
 
-module.exports = { getPlayUrl };
+module.exports = { getPlayUrl, playHandler: getPlayUrl };

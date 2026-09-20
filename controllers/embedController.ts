@@ -839,14 +839,36 @@ function embedHandler(req: Request, res: Response, next: NextFunction): any {
     video.addEventListener('playing',  () => buffering.classList.remove('visible'));
 
     // ── Fullscreen ─────────────────────────────────────────────
+    // iOS Safari no soporta requestFullscreen() ni screen.orientation.lock(),
+    // así que para iPhone/iPad usamos el fullscreen NATIVO del <video>
+    // (webkitEnterFullscreen): solo el video pasa a landscape y la página
+    // host queda portrait. En Android/desktop se mantiene el comportamiento
+    // actual (fullscreen del wrapper + lock landscape).
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+                  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    const supportsNativeVideoFS = typeof video.webkitEnterFullscreen === 'function';
+
     fsBtn.addEventListener('click', (e) => {
         e.stopPropagation();
+        if (isIOS && supportsNativeVideoFS) {
+            if (video.webkitDisplayingFullscreen) {
+                video.webkitExitFullscreen();
+            } else {
+                video.webkitEnterFullscreen();
+            }
+            return;
+        }
         if (!document.fullscreenElement) {
             wrap.requestFullscreen().catch(()=>{});
         } else {
             document.exitFullscreen().catch(()=>{});
         }
     });
+
+    if (supportsNativeVideoFS) {
+        video.addEventListener('webkitbeginfullscreen', () => { fsIcon.innerHTML = ICON_FS_EXIT; });
+        video.addEventListener('webkitendfullscreen',   () => { fsIcon.innerHTML = ICON_FS_ENTER; });
+    }
 
     document.addEventListener('fullscreenchange', () => {
         if (document.fullscreenElement) {
@@ -965,8 +987,14 @@ function embedHandler(req: Request, res: Response, next: NextFunction): any {
     }
 
     // ── Inicialización del reproductor ─────────────────────────
-    function startStreaming(streamUrl, type) {
+    // Si fallbackUrl viene definido, primero se prueba streamUrl (HLS directo
+    // del proveedor, sin pasar por el proxy). Para no congelar el reproductor,
+    // el intento directo usa reintentos mínimos y un watchdog de 6s: si falla
+    // (CORS/403/tokens caducos) o tarda demasiado, se pasa al proxy al instante.
+    function startStreaming(streamUrl, type, fallbackUrl) {
         if (type === 'm3u8' && Hls.isSupported()) {
+            const tryingDirect = !!fallbackUrl;
+
             hls = new Hls({
                 enableWorker:            true,
                 progressive:             true,
@@ -978,14 +1006,42 @@ function embedHandler(req: Request, res: Response, next: NextFunction): any {
                 maxBufferSize:           20 * 1024 * 1024,
                 nudgeOffset:             0.1,
                 nudgeMaxRetries:         10,
-                fragLoadingMaxRetry:     6,
-                manifestLoadingMaxRetry: 4,
-                levelLoadingMaxRetry:    4,
+                fragLoadingMaxRetry:     tryingDirect ? 2 : 6,
+                manifestLoadingMaxRetry: tryingDirect ? 1 : 4,
+                levelLoadingMaxRetry:    tryingDirect ? 1 : 4,
             });
+
+            let watchdog = null;
+
+            if (fallbackUrl) {
+                const currentHls = hls;
+                let usedFallback = false;
+
+                watchdog = setTimeout(() => {
+                    if (usedFallback) return;
+                    usedFallback = true;
+                    currentHls.destroy();
+                    hls = null;
+                    startStreaming(fallbackUrl, type);
+                }, 6000);
+
+                currentHls.on(Hls.Events.ERROR, (_evt, data) => {
+                    if (usedFallback) return;
+                    if (data.fatal && data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                        usedFallback = true;
+                        clearTimeout(watchdog);
+                        currentHls.destroy();
+                        hls = null;
+                        startStreaming(fallbackUrl, type);
+                    }
+                });
+            }
+
             hls.loadSource(streamUrl);
             hls.attachMedia(video);
 
             hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                if (watchdog) { clearTimeout(watchdog); watchdog = null; }
                 buildQualityUI();
             });
 
@@ -1005,6 +1061,12 @@ function embedHandler(req: Request, res: Response, next: NextFunction): any {
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
             // Safari nativo
             video.src = streamUrl;
+            if (fallbackUrl) {
+                video.addEventListener('error', function onNativeErr() {
+                    video.removeEventListener('error', onNativeErr);
+                    video.src = fallbackUrl;
+                }, { once: true });
+            }
         } else {
             video.src = streamUrl;
         }
@@ -1047,11 +1109,29 @@ function embedHandler(req: Request, res: Response, next: NextFunction): any {
                 }
             }
 
-            // Arrancar streaming en segundo plano (muted) mientras el loader está visible
-            startStreaming(finalUrl, data.type);
+            // Loader ágil: 3s mínimos de pre-buffer en segundo plano (para que
+            // hls.js detecte/descargue más TS mientras tanto). Se oculta antes
+            // si el video ya puede reproducirse, y jamás pasa del tope de 5s
+            // (así nunca queda colgado).
+            const MIN_LOADER_MS = 3000;
+            const MAX_LOADER_MS = 5000;
 
-            // Esperar los 9 segundos mínimos
-            await minWait;
+            const readyPromise = new Promise((resolve) => {
+                if (video.readyState >= 3) { resolve(); return; }
+                video.addEventListener('canplay', () => resolve(), { once: true });
+            });
+            const minLoader = new Promise((resolve) => setTimeout(resolve, MIN_LOADER_MS));
+            const capLoader = new Promise((resolve) => setTimeout(resolve, MAX_LOADER_MS));
+
+            // Arrancar streaming en segundo plano (muted) mientras el loader está visible
+            // StreamWish: si el proveedor ya entrega un HLS válido (directPlay),
+            // reproducimos su HLS directo (los segmentos NO pasan por el proxy).
+            // El proxy queda como respaldo automático si el directo bloquea por CORS.
+            const useDirect = data.directPlay && data.videoUrl;
+            startStreaming(useDirect ? data.videoUrl : finalUrl, data.type, useDirect ? finalUrl : null);
+
+            // Esperar: (3s mínimo Y video listo) o tope de 5s
+            await Promise.race([Promise.all([minLoader, readyPromise]), capLoader]);
 
             // Fade out del loader y mostrar video
             loader.classList.add('hidden');
@@ -1102,4 +1182,4 @@ function embedHandler(req: Request, res: Response, next: NextFunction): any {
   }
 }
 
-module.exports = { getEmbedHtml: embedHandler };
+module.exports = { getEmbedHtml: embedHandler, embedHandler };

@@ -19,6 +19,7 @@ export type ProviderName =
   | 'voe'
   | 'mp4upload'
   | 'dailymotion'
+  | 'goodstream'
   | 'direct'
   | 'unknown';
 
@@ -67,6 +68,7 @@ const PROVIDERS: Record<string, RegExp[]> = {
     /vsharea\.com/i,
     /minochinos\.com/i,
     /callistanise\.com/i,
+    /morencius\.com/i,
   ],
   filemoon: [
     /filemoon\.(sx|com|to)/i,
@@ -76,14 +78,21 @@ const PROVIDERS: Record<string, RegExp[]> = {
     /bysesukior\.com/i,
     /398fitus\.com/i,
   ],
+  goodstream: [
+    /goodstream\.(one|pro|cc)/i,
+    /gdstream\.xyz/i,
+    /gd-stream\.com/i,
+    /goodstreamz\.com/i,
+  ],
   nupload: [
-    /nupload\.me/i,
+    /nupload\.(me|top|my)/i,
   ],
   earvids: [
     /earvids\.com/i,
   ],
   voe: [
     /voe\.sx/i,
+    /johnfullwonder\.com/i,
     /charlestoughrace\.com/i,
     /reitshof\.com/i,
     /v-o-e\.com/i,
@@ -92,6 +101,8 @@ const PROVIDERS: Record<string, RegExp[]> = {
     /richardquestionbuilding\.com/i,
     /jenniferperformer\.com/i,
     /p-v-o-e\.com/i,
+    /nicolehappyoutside\.com/i,
+    /rebeccapracticeloss\.com/i,
   ],
   mp4upload: [
     /mp4upload\.com/i,

@@ -12,6 +12,7 @@ const streamwish = require('../services/streamwish');
 const vidhide = require('../services/vidhide');
 const filemoon = require('../services/filemoon');
 const voe = require('../services/voe');
+const goodstream = require('../services/goodstream');
 const doodstream = require('../services/doodstream');
 const streamtape = require('../services/streamtape');
 const dailymotion = require('../services/dailymotion');
@@ -23,73 +24,90 @@ const espn2 = require('../services/envivos/espn2');
 const tudn = require('../services/envivos/tudn');
 const tycsports = require('../services/envivos/tycsports');
 const telemundo = require('../services/envivos/telemundo');
+// Mapa proveedor → servicio HTTP
+const HTTP_SERVICE_MAP = {
+    streamwish,
+    hgcloud: streamwish,
+    vidhide,
+    filemoon,
+    voe,
+    goodstream,
+    doodstream,
+    streamtape,
+    dailymotion,
+    earvids,
+    nupload,
+};
 async function extractVideo(req, res) {
-    const url = req.query.url;
-    if (!url) {
-        return res.status(400).json({ ok: false, error: 'Falta parámetro url' });
-    }
-    const provider = detectProvider(url);
-    console.log(`[ExtractController] Detectado proveedor: ${provider} para ${url}`);
-    let extractor;
-    switch (provider) {
-        case 'streamwish':
-        case 'hgcloud':
-            extractor = streamwish;
-            break;
-        case 'vidhide':
-            extractor = vidhide;
-            break;
-        case 'filemoon':
-            extractor = filemoon;
-            break;
-        case 'voe':
-            extractor = voe;
-            break;
-        case 'doodstream':
-            extractor = doodstream;
-            break;
-        case 'streamtape':
-            extractor = streamtape;
-            break;
-        case 'dailymotion':
-            extractor = dailymotion;
-            break;
-        case 'earvids':
-            extractor = earvids;
-            break;
-        case 'nupload':
-            extractor = nupload;
-            break;
-        case 'mp4upload':
-        case 'direct':
-        case 'unknown':
-        default:
-            extractor = generic;
-            break;
-    }
     try {
-        const result = await extractor.extract(url);
-        const host = req.get('host');
-        const proto = req.headers['x-forwarded-proto'] || req.protocol;
-        // Generar la URL final del proxy
-        const proxyUrl = `${proto}://${host}/proxy?url=${encodeURIComponent(result.videoUrl)}` +
-            `&referer=${encodeURIComponent(result.referer || '')}` +
-            (result.wrapLevel ? `&wrap=${result.wrapLevel}` : '');
-        const isHlsTxt = result.videoUrl.includes('master.txt') || result.videoUrl.includes('playlist.txt');
+        const { url, mode = 'auto' } = req.query;
+        if (!url) {
+            return res.status(400).json({ ok: false, error: 'Parámetro "url" requerido.' });
+        }
+        let decodedUrl;
+        try {
+            decodedUrl = decodeURIComponent(url);
+            new URL(decodedUrl);
+        }
+        catch {
+            return res.status(400).json({ ok: false, error: 'La URL proporcionada no es válida.' });
+        }
+        const provider = detectProvider(decodedUrl);
+        console.log(`[Extract] Proveedor detectado: ${provider} → ${decodedUrl}`);
+        let result = null;
+        let method = null;
+        if (mode === 'puppeteer') {
+            const puppeteerExtractor = require('../services/puppeteerExtractor');
+            result = await puppeteerExtractor.extract(decodedUrl);
+            method = 'puppeteer';
+        }
+        else if (mode === 'http') {
+            const service = HTTP_SERVICE_MAP[provider];
+            if (!service)
+                throw new Error(`Proveedor HTTP no soportado: ${provider}`);
+            result = await service.extract(decodedUrl);
+            method = 'http';
+        }
+        else {
+            // MODO AUTO: intenta HTTP primero y cae a Puppeteer como respaldo
+            const service = HTTP_SERVICE_MAP[provider];
+            try {
+                if (!service)
+                    throw new Error(`Proveedor HTTP no soportado: ${provider}`);
+                result = await service.extract(decodedUrl);
+                method = 'http';
+            }
+            catch (err) {
+                console.warn(`[Extract] HTTP falló para ${provider}, intentando Puppeteer...`);
+                const puppeteerExtractor = require('../services/puppeteerExtractor');
+                result = await puppeteerExtractor.extract(decodedUrl);
+                method = 'puppeteer';
+            }
+        }
+        const { videoUrl, type, referer = '' } = result;
+        const isHlsTxt = /\.txt(\?|$)/i.test(videoUrl) &&
+            (type === 'm3u8' || /\/hls\/|master|playlist/i.test(videoUrl));
+        // SOLUCIÓN DEFINITIVA: Usar ruta relativa.
+        // Esto evita que el navegador se queje de Mixed Content (HTTP vs HTTPS).
+        const wrapParam = result.wrapLevel ? `&wrapM3u8=${encodeURIComponent(result.wrapLevel)}` : '';
+        const proxyUrl = `/proxy?url=${encodeURIComponent(videoUrl)}` +
+            `&referer=${encodeURIComponent(referer)}` +
+            (isHlsTxt ? '&forceM3u8=1' : '') +
+            wrapParam;
         const response = {
             ok: true,
-            videoUrl: result.videoUrl,
+            videoUrl,
             proxyUrl,
-            type: result.type,
+            type,
             provider,
             isHlsTxt,
-            method: result.method || null
+            method,
         };
-        res.json(response);
+        return res.json(response);
     }
-    catch (error) {
-        console.error(`[ExtractController] Error extrayendo ${url}:`, error.message);
-        res.status(500).json({ ok: false, error: error.message });
+    catch (err) {
+        console.error('[Extract Error]', err.message);
+        return res.status(500).json({ ok: false, error: err.message });
     }
 }
 /**

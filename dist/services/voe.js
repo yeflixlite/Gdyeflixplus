@@ -21,14 +21,13 @@ const extractionCache = new Map();
 const CACHE_TTL = 1000 * 60 * 60;
 /* ── Dominios reconocidos de VOE ────────── */
 const VOE_DOMAINS = [
-    'nicolehappyoutside.com',
     'voe.sx',
+    'johnfullwonder.com',
     'charlestoughrace.com',
-    'reitshof.com',
-    'v-o-e.com',
-    'voe-video.com',
+    'timmaybealready.com',
     'richardquestionbuilding.com',
-    'jenniferperformer.com'
+    'nicolehappyoutside.com',
+    'rebeccapracticeloss.com'
 ];
 /**
  * Decodifica el JSON ofuscado de VOE.
@@ -79,15 +78,15 @@ async function extract(url) {
         console.log(`[VOE] ⚡ Resultado obtenido de CACHE en memoria para ID: ${id}`);
         return cached.result;
     }
-    // Espejos limpios de VOE y nuevos dominios detectados
+    // Espejos limpios de VOE (eliminados los que tienen DNS muerto o llevan
+    // a captcha: reitshof.com, v-o-e.com, voe-video.com, jenniferperformer.com, p-v-o-e.com)
     const CLEAN_MIRRORS = [
-        'nicolehappyoutside.com',
-        'timmaybealready.com',
+        'johnfullwonder.com', // ← host actual (destino del redirect de voe.sx)
         'charlestoughrace.com',
-        'reitshof.com',
+        'timmaybealready.com',
         'richardquestionbuilding.com',
-        'jenniferperformer.com',
-        'p-v-o-e.com'
+        'nicolehappyoutside.com',
+        'rebeccapracticeloss.com'
     ];
     // Lista de hosts a probar
     const hostsToTry = [u.host, ...CLEAN_MIRRORS];

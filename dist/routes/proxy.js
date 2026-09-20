@@ -9,8 +9,8 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = __importDefault(require("express"));
-const { proxyVideo } = require('../controllers/proxyController');
+const { proxyHandler } = require('../controllers/proxyController');
 const router = express_1.default.Router();
 // GET /proxy?url=...&referer=...
-router.get('/', proxyVideo);
+router.get('/', proxyHandler);
 module.exports = router;

@@ -51,6 +51,8 @@ export interface PlayResponse {
   type:      VideoType;
   provider:  string;
   method:    string | null;
+  /** ÓPTIMO DE BANDA: el m3u8 puede reproducirse directo desde el CDN (solo proxy como fallback) */
+  directPlay?: boolean;
 }
 
 // ── Respuesta del endpoint /extract ─────────────────────────

@@ -1,7 +1,8 @@
 /**
  * ============================================================
  *  controllers/proxyController.ts
- *  Proxy de Video / HLS que soluciona los problemas de CORS.
+ *  Sirve el contenido del video evitando CORS.
+ *  Optimizado para Filemoon (persistencia de tokens de sesión).
  * ============================================================
  */
 'use strict';
@@ -10,195 +11,411 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const axios_1 = __importDefault(require("axios"));
+const zlib_1 = __importDefault(require("zlib"));
 const url_1 = __importDefault(require("url"));
+const http_1 = __importDefault(require("http"));
+const https_1 = __importDefault(require("https"));
 const { getMediaHeaders } = require('../utils/browserHeaders');
-const HttpsProxyAgent = require('https-proxy-agent');
-const http = require('http');
-const https = require('https');
-// Pool de agentes para reutilizar conexiones (Keep-Alive)
-const agentOptions = { keepAlive: true, maxSockets: 50 };
-const httpAgent = new http.Agent(agentOptions);
-const httpsAgent = new https.Agent(agentOptions);
-/**
- * Proxy principal para archivos HLS y Video.
- */
-async function proxyVideo(req, res) {
-    const targetUrl = req.query.url;
-    const referer = req.query.referer || '';
-    const isDash = req.query.type === 'dash';
-    const wrapLevel = req.query.wrap;
-    const embedUrl = req.query.embed_url || ''; // Para re-extracción VOE en caso de 403
-    if (!targetUrl)
-        return res.status(400).send('Error: Falta URL');
-    try {
-        const origin = referer ? new URL(referer).origin : new URL(targetUrl).origin;
-        const isM3u8 = targetUrl.includes('.m3u8') || targetUrl.includes('.txt') || isDash;
-        const reqHeaders = {
-            ...getMediaHeaders(referer, origin),
-            'Accept': isM3u8 ? '*/*' : 'video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5'
-        };
-        // Detectar proveedor basado en la URL
-        const isVoe = targetUrl.includes('voe') || targetUrl.includes('ugc-cdn-caching') || targetUrl.includes('cloudwindow-route') || targetUrl.includes('hls2-c');
-        const isStreamwish = targetUrl.includes('streamwish') || targetUrl.includes('premilkyway') || targetUrl.includes('goldenfieldcreativeworks');
-        // SOLO enviar X-Forwarded-For en Streamwish para evitar el rate-limit de IP dual.
-        // En VOE estropea la comprobación de IP y causa 403.
-        if (isStreamwish) {
-            if (req.headers['x-forwarded-for']) {
-                reqHeaders['X-Forwarded-For'] = req.headers['x-forwarded-for'];
-            }
-            if (req.headers['x-real-ip']) {
-                reqHeaders['X-Real-IP'] = req.headers['x-real-ip'];
-            }
-        }
-        if (req.headers.range)
-            reqHeaders['Range'] = req.headers.range;
-        // AXIOS REQUEST
-        const response = await (0, axios_1.default)({
-            method: 'GET',
-            url: targetUrl,
-            headers: reqHeaders,
-            responseType: isM3u8 ? 'text' : 'stream',
-            maxRedirects: 5,
-            validateStatus: () => true, // Permitir cualquier código
-            httpAgent,
-            httpsAgent,
-        });
-        // COPIAR HEADERS
-        const headersToCopy = ['content-type', 'content-length', 'accept-ranges', 'content-range', 'cache-control'];
-        headersToCopy.forEach(h => {
-            if (response.headers[h])
-                res.set(h, response.headers[h]);
-        });
-        res.set('Access-Control-Allow-Origin', '*');
-        // HLS / M3U8 PROCESSING
-        if (isM3u8) {
-            let body = response.data;
-            // Validar que la respuesta sea M3U8 real (no una página HTML de error 403)
-            const isValidM3u8 = typeof body === 'string' && (body.trimStart().startsWith('#EXTM3U') ||
-                body.includes('#EXT-X-') ||
-                body.includes('#EXTINF'));
-            // Si la validación falla, intentar re-extracción para VOE
-            if (!isValidM3u8 && isVoe && embedUrl) {
-                console.log(`[Proxy] VOE 403 detectado. Re-extrayendo desde: ${embedUrl}`);
-                try {
-                    const voe = require('../services/voe');
-                    const freshResult = await voe.extract(embedUrl);
-                    // Reintentar con la URL fresca (misma IP de esta función)
-                    const freshResponse = await (0, axios_1.default)({
-                        method: 'GET',
-                        url: freshResult.videoUrl,
-                        headers: reqHeaders,
-                        responseType: 'text',
-                        maxRedirects: 5,
-                        validateStatus: () => true,
-                        httpAgent,
-                        httpsAgent,
-                    });
-                    body = freshResponse.data;
-                    const isNowValid = typeof body === 'string' && (body.trimStart().startsWith('#EXTM3U') ||
-                        body.includes('#EXT-X-') ||
-                        body.includes('#EXTINF'));
-                    if (!isNowValid) {
-                        console.error(`[Proxy] Re-extracción VOE también falló (status=${freshResponse.status})`);
-                        res.set('Content-Type', 'application/json');
-                        return res.status(freshResponse.status || 403).json({ error: 'VOE: El CDN sigue rechazando la solicitud tras re-extraer.' });
-                    }
-                    console.log('[Proxy] VOE re-extracción exitosa.');
-                }
-                catch (reExtractErr) {
-                    console.error('[Proxy] Error en re-extracción VOE:', reExtractErr.message);
-                    res.set('Content-Type', 'application/json');
-                    return res.status(503).json({ error: 'VOE: No se pudo re-extraer el enlace.' });
-                }
-            }
-            else if (!isValidM3u8) {
-                const statusCode = response.status !== 200 ? response.status : 403;
-                console.error(`[Proxy] Respuesta no-M3U8 (status=${response.status}) para: ${targetUrl.substring(0, 80)}`);
-                res.set('Content-Type', 'application/json');
-                return res.status(statusCode).json({ error: `El CDN devolvió un error (${statusCode}) en lugar del playlist M3U8.` });
-            }
-            res.status(200);
-            const host = req.get('host');
-            const proto = req.headers['x-forwarded-proto'] || req.protocol;
-            // Incluir embed_url en el proxyBase para que las sub-playlists puedan re-extraer también
-            const embedParam = embedUrl ? `&embed_url=${encodeURIComponent(embedUrl)}` : '';
-            const proxyBase = `${proto}://${host}/proxy?referer=${encodeURIComponent(referer)}${embedParam}&url=`;
-            if (isDash) {
-                // Rewrite DASH (.mpd)
-                body = body.replace(/(<BaseURL>)(.*?)(<\/BaseURL>)/gi, (match, p1, p2, p3) => {
-                    const absoluteUrl = url_1.default.resolve(targetUrl, p2);
-                    return `${p1}${proxyBase}${encodeURIComponent(absoluteUrl)}&type=dash${p3}`;
-                });
-                body = body.replace(/media="(.*?)"/gi, (match, p1) => {
-                    const absoluteUrl = url_1.default.resolve(targetUrl, p1);
-                    return `media="${proxyBase}${encodeURIComponent(absoluteUrl)}&type=dash"`;
-                });
-                body = body.replace(/initialization="(.*?)"/gi, (match, p1) => {
-                    const absoluteUrl = url_1.default.resolve(targetUrl, p1);
-                    return `initialization="${proxyBase}${encodeURIComponent(absoluteUrl)}&type=dash"`;
-                });
-            }
-            else {
-                // Rewrite HLS (.m3u8)
-                body = body.split('\n').map(line => {
-                    const trimmed = line.trim();
-                    if (trimmed === '')
-                        return line;
-                    // Extraer lógica para hacer las URLs absolutas
-                    const makeAbsolute = (uri) => {
-                        if (uri.startsWith('http'))
-                            return uri;
-                        const basePath = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
-                        return uri.startsWith('/') ? new URL(targetUrl).origin + uri : basePath + uri;
-                    };
-                    // Reescribir URI="..." dentro de las etiquetas #EXT (ej. #EXT-X-MEDIA para audios)
-                    if (trimmed.startsWith('#')) {
-                        if (trimmed.includes('URI="')) {
-                            return trimmed.replace(/URI="(.*?)"/gi, (match, uri) => {
-                                const absolute = makeAbsolute(uri);
-                                if (absolute.includes('.m3u8') || absolute.includes('.txt')) {
-                                    return `URI="${proxyBase}${encodeURIComponent(absolute)}"`;
-                                }
-                                // Streamwish: sus CDN tienen CORS → bypass directo evita stuttering
-                                // Voe y otros: sus CDN NO tienen CORS → deben pasar por el proxy
-                                if (isStreamwish)
-                                    return `URI="${absolute}"`;
-                                return `URI="${proxyBase}${encodeURIComponent(absolute)}"`;
-                            });
-                        }
-                        return line;
-                    }
-                    const absolute = makeAbsolute(trimmed);
-                    // Sub-playlists: siempre por el proxy (necesario para reescribir URLs)
-                    if (absolute.includes('.m3u8') || absolute.includes('.txt')) {
-                        return `${proxyBase}${encodeURIComponent(absolute)}`;
-                    }
-                    // Fragmentos (.ts, .mp4, etc.)
-                    // Streamwish: CDN tiene CORS → bypass directo (velocidad máxima, sin cuello de botella)
-                    // Voe y otros: CDN sin CORS → pasar por proxy
-                    if (isStreamwish)
-                        return absolute;
-                    return `${proxyBase}${encodeURIComponent(absolute)}`;
-                }).join('\n');
-                // Si se necesita envolver un playlist single-level en un master sintético
-                if (wrapLevel && !body.includes('#EXT-X-STREAM-INF')) {
-                    const masterPlaylist = `#EXTM3U\n` +
-                        `#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720,NAME="${wrapLevel}"\n` +
-                        `data:application/vnd.apple.mpegurl;base64,${Buffer.from(body).toString('base64')}\n`;
-                    return res.send(masterPlaylist);
-                }
-            }
-            return res.send(body);
-        }
-        // VIDEO STREAM (MP4/TS)
-        else {
-            res.set('Cache-Control', 'public, max-age=86400'); // Cache agresiva para segmentos
-            response.data.pipe(res);
-        }
+const { detectProvider } = require('../utils/urlDetector');
+/* ── CONFIGURACIÓN DE AHORRO DE BANDA ───────────────────────── */
+// Si es 'false', los segmentos (.ts) se cargan directo del CDN original.
+// Esto ahorra el 95% del ancho de banda del servidor.
+const PROXY_SEGMENTS = process.env.PROXY_SEGMENTS === 'true';
+const IS_PROD = process.env.NODE_ENV === 'production';
+// Lista de dominios que permiten carga directa (CORS abierto sin IP-binding)
+// NOTA: Si un dominio bloquea por CORS en el navegador, NO debe estar aquí.
+// VOE (*.cloudwindow-route.com) fue RETIRADO (16/09/2026): el CDN ya no envía
+// Access-Control-Allow-Origin desde el navegador y los tokens quedan ligados a
+// la IP del servidor → 403/CORS en directo. El tráfico VOE DEBE pasar por el
+// proxy (hot-swap incluido).
+const DIRECT_DOMAINS = [
+    // Filemoon CDN: *.r66nv9ed.com responde ACAO: * en master/variante/segmentos
+    // sin cifrado EXT-X-KEY → se puede saltar el proxy.
+    'r66nv9ed.com',
+    // VidHide MIRRORS: cuando el m3u8 usa /stream/ del mirror, los segmentos
+    // los sirve el mismo mirror con CORS abierto (no el CDN acek/dramiyos)
+    'minochinos.com', 'callistanise.com', 'vsharea.com', 'vidhidepro.com', 'vidhide.com',
+    // Otros CDNs sin restricciones conocidas
+    'doodstream.com', 'dood.re',
+    'filemoon.sx', 'googleusercontent.com', 'cloudfront.net',
+];
+// Agentes con Keep-Alive para rendimiento
+const httpAgent = new http_1.default.Agent({ keepAlive: true, maxSockets: 50 });
+const httpsAgent = new https_1.default.Agent({ keepAlive: true, maxSockets: 50 });
+const AD_BLOCKLIST = [
+    'tiktokcdn.com', 'doubleclick.net', 'adnxs.com', 'advertising.com',
+    'quantserve.com', 'scorecardresearch.com', 'clisky.xyz', 'trbt.it'
+];
+// ── Cache en memoria para M3U8 maestros ──────────────────────
+// TTL de 8 segundos: el suficiente para absorber picos de usuarios,
+// sin servir listas tan viejas que tengan segmentos expirados.
+const m3u8Cache = new Map();
+const M3U8_CACHE_TTL = 8000; // 8 segundos
+function getCached(key) {
+    const entry = m3u8Cache.get(key);
+    if (!entry)
+        return null;
+    if (Date.now() - entry.ts > M3U8_CACHE_TTL) {
+        m3u8Cache.delete(key);
+        return null;
     }
-    catch (error) {
-        console.error(`[Proxy] Error para ${targetUrl}:`, error.message);
-        res.status(500).send('Error en el proxy');
+    return entry.body;
+}
+function setCache(key, body) {
+    // Limitar el tamaño del caché para no agotar la RAM de Vercel
+    if (m3u8Cache.size > 100) {
+        const firstKey = m3u8Cache.keys().next().value;
+        m3u8Cache.delete(firstKey);
+    }
+    m3u8Cache.set(key, { body, ts: Date.now() });
+}
+/**
+ * Resuelve URLs relativas conservando los Query Params de la base.
+ * CRÍTICO para Filemoon y similares donde los segmentos dependen del token de la playlist.
+ */
+function resolveUrl(target, base) {
+    if (target.startsWith('http'))
+        return target;
+    const baseUrl = new URL(base);
+    let resolved;
+    if (target.startsWith('//')) {
+        resolved = new URL(`${baseUrl.protocol}${target}`);
+    }
+    else if (target.startsWith('/')) {
+        resolved = new URL(`${baseUrl.origin}${target}`);
+    }
+    else {
+        const dirPath = baseUrl.pathname.substring(0, baseUrl.pathname.lastIndexOf('/') + 1);
+        resolved = new URL(`${baseUrl.origin}${dirPath}${target}`);
+    }
+    // SI LA BASE TIENE PARÁMETROS (?, t=, s=, e=) Y EL TARGET NO, SE LOS PASAMOS
+    if (baseUrl.search) {
+        const baseParams = baseUrl.searchParams;
+        const targetParams = resolved.searchParams;
+        // Parámetros críticos de StreamWish/Filemoon
+        ['t', 's', 'e', 'token'].forEach(p => {
+            if (baseParams.has(p) && !targetParams.has(p)) {
+                targetParams.set(p, baseParams.get(p));
+            }
+        });
+    }
+    return resolved.toString();
+}
+function rewriteM3u8(content, originalUrl, proxyBase, referer) {
+    const encodedReferer = encodeURIComponent(referer || '');
+    // 1. Líneas de segmentos
+    let rewritten = content.replace(/^(?!#)(.+)$/gm, (line) => {
+        line = line.trim();
+        if (!line)
+            return line;
+        const abs = resolveUrl(line, originalUrl);
+        // Bloqueo de anuncios
+        const isAd = AD_BLOCKLIST.some(domain => abs.includes(domain));
+        if (isAd)
+            return abs;
+        // LÓGICA DE AHORRO: ¿Debemos saltarnos el proxy para este segmento?
+        const isSegment = abs.includes('.ts') || abs.includes('.m4s') || abs.includes('.mp4') || abs.includes('/seg-') || abs.includes('.woff2');
+        const canBeDirect = DIRECT_DOMAINS.some(d => abs.includes(d));
+        if (isSegment && !PROXY_SEGMENTS && canBeDirect) {
+            // Devolvemos la URL directa. Ahorramos 100% de banda en este fragmento.
+            return abs;
+        }
+        return `${proxyBase}?url=${encodeURIComponent(abs)}&referer=${encodedReferer}`;
+    });
+    // 2. Atributos URI (Audio, Key, etc.)
+    rewritten = rewritten.replace(/URI=["']([^"']+)["']/g, (_match, captured) => {
+        const abs = resolveUrl(captured, originalUrl);
+        return `URI="${proxyBase}?url=${encodeURIComponent(abs)}&referer=${encodedReferer}&forceM3u8=1"`;
+    });
+    // 3. Arreglo para "Nivel 0" (VOE / Filemoon)
+    // Aseguramos que la línea tenga RESOLUTION y NAME válidos.
+    // Algunos servidores envían RESOLUTION=0x0 que confunde al reproductor.
+    rewritten = rewritten.replace(/#EXT-X-STREAM-INF:([^\r\n]+)/g, (_match, attributes) => {
+        let newAttributes = attributes;
+        let res = '1280x720';
+        let name = '"720p"';
+        const resMatch = attributes.match(/RESOLUTION=(\d+)x(\d+)/i);
+        if (resMatch) {
+            const height = parseInt(resMatch[2]);
+            res = `${resMatch[1]}x${resMatch[2]}`;
+            if (height >= 2160)
+                name = '"4K"';
+            else if (height >= 1080)
+                name = '"1080p"';
+            else if (height >= 720)
+                name = '"720p"';
+            else if (height >= 480)
+                name = '"480p"';
+            else if (height >= 360)
+                name = '"360p"';
+            else
+                name = `"${height}p"`;
+        }
+        else {
+            if (attributes.includes('1080p') || attributes.includes('1920x1080')) {
+                res = '1920x1080';
+                name = '"1080p"';
+            }
+            else if (attributes.includes('480p') || attributes.includes('854x480')) {
+                res = '854x480';
+                name = '"480p"';
+            }
+            else if (attributes.includes('360p') || attributes.includes('640x360')) {
+                res = '640x360';
+                name = '"360p"';
+            }
+            else if (attributes.includes('4K') || attributes.includes('2160p')) {
+                res = '3840x2160';
+                name = '"4K"';
+            }
+        }
+        newAttributes = newAttributes.replace(/,?RESOLUTION=[^\s,]+/gi, '');
+        newAttributes = newAttributes.replace(/,?NAME=[^\s,]+/gi, '');
+        newAttributes += `,RESOLUTION=${res},NAME=${name}`;
+        return `#EXT-X-STREAM-INF:${newAttributes}`;
+    });
+    return rewritten;
+}
+// ── Fetch con reintento ──────────────────────────────────────
+async function fetchUpstream(url, headers, timeout, req) {
+    const controller = new AbortController();
+    if (req) {
+        req.on('close', () => {
+            controller.abort();
+        });
+    }
+    const config = {
+        headers,
+        responseType: 'stream',
+        httpAgent,
+        httpsAgent,
+        maxRedirects: 10,
+        timeout,
+        signal: controller.signal,
+        validateStatus: (status) => status < 400 || status === 403,
+    };
+    try {
+        return await axios_1.default.get(url, config);
+    }
+    catch (err) {
+        if (axios_1.default.isCancel(err))
+            throw err;
+        // Un solo reintento automático antes de rendirse
+        if (!IS_PROD)
+            console.log(`[Proxy] ⚠️ Reintentando: ${url.substring(0, 60)}...`);
+        return await axios_1.default.get(url, config);
     }
 }
-module.exports = { proxyVideo };
+async function proxyHandler(req, res) {
+    try {
+        const { url, referer = '', forceM3u8 = '0', wrapM3u8 = '', wrap: wrapAlias = '', type = '', embed_url = '', } = req.query;
+        if (!url)
+            return res.status(400).end();
+        let decodedUrl = decodeURIComponent(url);
+        const decodedReferer = referer ? decodeURIComponent(referer) : '';
+        let origin = '';
+        try {
+            origin = new URL(decodedUrl).origin;
+        }
+        catch { /* url relativa */ }
+        const isAd = AD_BLOCKLIST.some(domain => decodedUrl.includes(domain));
+        if (isAd)
+            return res.status(404).end();
+        const isDash = type === 'dash' || decodedUrl.includes('.mpd');
+        const isM3u8Request = decodedUrl.includes('.m3u') ||
+            forceM3u8 === '1' ||
+            isDash;
+        // Log solo en desarrollo
+        if (!IS_PROD && isM3u8Request) {
+            console.log(`[Proxy] 📄 Manifest: ${decodedUrl.substring(0, 70)}...`);
+        }
+        const wrapLevel = wrapM3u8 || wrapAlias;
+        // Servir desde caché si existe
+        if (isM3u8Request) {
+            const cached = getCached(decodedUrl + (wrapLevel ? '?wrap=' + wrapLevel : ''));
+            if (cached) {
+                res.status(200);
+                res.setHeader('Access-Control-Allow-Origin', '*');
+                res.setHeader('Content-Type', isDash ? 'application/dash+xml' : 'application/vnd.apple.mpegurl');
+                res.setHeader('X-Cache', 'HIT');
+                return sendCompressed(req, res, cached);
+            }
+        }
+        // LOGICA DE REFERER
+        let targetOrigin = '';
+        try {
+            targetOrigin = new URL(decodedUrl).origin;
+        }
+        catch { /* url relativa */ }
+        const effectiveReferer = decodedReferer || targetOrigin;
+        const headers = getMediaHeaders(effectiveReferer, targetOrigin);
+        if (req.headers.range) {
+            headers['Range'] = req.headers.range;
+        }
+        // StreamWish: reenviar la IP real para evitar su rate-limit de IP dual.
+        // En VOE estropea la comprobación de IP y causa 403.
+        const isStreamwish = decodedUrl.includes('streamwish') || decodedUrl.includes('premilkyway') || decodedUrl.includes('goldenfieldcreativeworks');
+        if (isStreamwish) {
+            if (req.headers['x-forwarded-for'])
+                headers['X-Forwarded-For'] = req.headers['x-forwarded-for'];
+            if (req.headers['x-real-ip'])
+                headers['X-Real-IP'] = req.headers['x-real-ip'];
+        }
+        // Timeout diferenciado
+        // M3U8/playlists son archivos pequeños → fallar rápido (8s)
+        // Segmentos de video pueden ser pesados → más tiempo (15s)
+        const isSegment = decodedUrl.includes('.ts') ||
+            decodedUrl.includes('.m4s') ||
+            decodedUrl.includes('.mp4');
+        const timeout = isM3u8Request ? 8000 : (isSegment ? 15000 : 20000);
+        let upstream = await fetchUpstream(decodedUrl, headers, timeout, req);
+        // ── RE-EXTRACCIÓN PARA VOE (ERROR 403 IP-BINDING M3U8 y TS) ──
+        if (upstream.status === 403) {
+            if (detectProvider(effectiveReferer) === 'voe' || detectProvider(decodedUrl) === 'voe') {
+                console.log(`[Proxy] ⚠️ Error 403 en VOE para ${isM3u8Request ? 'M3U8' : 'Fragmento TS'}. Iniciando re-extracción en caliente (Hot-Swap)...`);
+                try {
+                    const voeService = require('../services/voe');
+                    // Extraer el ID real del video de la URL del CDN si es posible
+                    let extractTarget = effectiveReferer || (embed_url ? decodeURIComponent(embed_url) : '');
+                    const videoIdMatch = decodedUrl.match(/\/([a-zA-Z0-9]+)_[a-zA-Z0-9,]*\.urlset\//);
+                    if (videoIdMatch && videoIdMatch[1]) {
+                        extractTarget = 'https://voe.sx/e/' + videoIdMatch[1];
+                        console.log(`[Proxy] 🔍 ID de VOE detectado en la URL: ${videoIdMatch[1]}`);
+                    }
+                    const result = await voeService.extract(extractTarget);
+                    if (result && result.videoUrl) {
+                        if (isM3u8Request) {
+                            // Es un M3U8 maestro, usamos la nueva URL entera
+                            if (result.videoUrl !== decodedUrl) {
+                                console.log(`[Proxy] ✅ Re-extracción M3U8 exitosa. Reintentando...`);
+                                decodedUrl = result.videoUrl;
+                                let newOrigin = '';
+                                try {
+                                    newOrigin = new URL(decodedUrl).origin;
+                                }
+                                catch { /* relativa */ }
+                                const newHeaders = getMediaHeaders(effectiveReferer, newOrigin);
+                                upstream = await fetchUpstream(decodedUrl, newHeaders, timeout, req);
+                            }
+                        }
+                        else if (isSegment) {
+                            // Es un fragmento TS. Hacemos HOT-SWAPPING de los tokens del query string
+                            const newMasterUrl = new URL(result.videoUrl);
+                            const oldSegmentUrl = new URL(decodedUrl);
+                            // Mantenemos la ruta del segmento viejo pero le inyectamos los tokens criptográficos nuevos
+                            oldSegmentUrl.search = newMasterUrl.search;
+                            decodedUrl = oldSegmentUrl.toString();
+                            console.log(`[Proxy] ✅ Hot-Swap de TS exitoso. Reintentando fragmento con nueva IP local...`);
+                            let newOrigin = '';
+                            try {
+                                newOrigin = new URL(decodedUrl).origin;
+                            }
+                            catch { /* relativa */ }
+                            const newHeaders = getMediaHeaders(effectiveReferer, newOrigin);
+                            upstream = await fetchUpstream(decodedUrl, newHeaders, timeout, req);
+                        }
+                    }
+                }
+                catch (retryErr) {
+                    console.error(`[Proxy] ❌ Falló el Hot-Swap de VOE:`, retryErr.message);
+                }
+            }
+        }
+        const isM3u8 = isM3u8Request ||
+            (upstream.headers['content-type'] || '').includes('mpegurl') ||
+            forceM3u8 === '1';
+        // Para VOE, si después del reintento sigue siendo 403 y enviando HTML, cortamos aquí
+        if (upstream.status === 403 && isM3u8 && !isDash) {
+            return res.status(403).end();
+        }
+        res.status(upstream.status);
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range');
+        if (!isM3u8 && !isDash) {
+            const contentType = upstream.headers['content-type'] || 'application/octet-stream';
+            res.setHeader('Content-Type', contentType);
+            const forwardHeaders = ['content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag'];
+            forwardHeaders.forEach(h => { if (upstream.headers[h])
+                res.setHeader(h, upstream.headers[h]); });
+            upstream.data.pipe(res);
+            return;
+        }
+        // Recopilar el cuerpo del manifest y procesarlo
+        res.setHeader('Content-Type', isDash ? 'application/dash+xml' : 'application/vnd.apple.mpegurl');
+        res.setHeader('X-Cache', 'MISS');
+        let body = '';
+        upstream.data.on('data', (chunk) => { body += chunk; });
+        upstream.data.on('end', () => {
+            // ── DASH (.mpd) ──
+            if (isDash) {
+                const host = req.get('host');
+                const proto = req.headers['x-forwarded-proto'] || req.protocol;
+                const proxyBase = `${proto}://${host}/proxy?referer=${encodeURIComponent(decodedReferer)}&type=dash&url=`;
+                body = body.replace(/(<BaseURL>)(.*?)(<\/BaseURL>)/gi, (_m, p1, p2, p3) => {
+                    const absoluteUrl = url_1.default.resolve(decodedUrl, p2);
+                    return `${p1}${proxyBase}${encodeURIComponent(absoluteUrl)}${p3}`;
+                });
+                body = body.replace(/media="(.*?)"/gi, (_m, p1) => {
+                    const absoluteUrl = url_1.default.resolve(decodedUrl, p1);
+                    return `media="${proxyBase}${encodeURIComponent(absoluteUrl)}"`;
+                });
+                body = body.replace(/initialization="(.*?)"/gi, (_m, p1) => {
+                    const absoluteUrl = url_1.default.resolve(decodedUrl, p1);
+                    return `initialization="${proxyBase}${encodeURIComponent(absoluteUrl)}"`;
+                });
+                return sendCompressed(req, res, body);
+            }
+            // ── VALIDACIÓN ESTRICTA M3U8 (Evitar parsear HTML de error) ──
+            if (!body.includes('#EXTM3U')) {
+                console.error(`[Proxy] ❌ Contenido M3U8 Inválido (Posible 403 HTML oculto).`);
+                return res.end(); // Retorna vacío en lugar de enviar basura
+            }
+            let processed = rewriteM3u8(body, decodedUrl, '/proxy', decodedReferer);
+            // wrapM3u8: Si el m3u8 es una playlist de un solo nivel (sin #EXT-X-STREAM-INF),
+            // lo envolvemos en un master sintético para que el reproductor muestre la calidad correcta.
+            if (wrapLevel && processed.includes('#EXTINF') && !processed.includes('#EXT-X-STREAM-INF')) {
+                const levelName = decodeURIComponent(wrapLevel); // ej. "720p"
+                const resMap = { '1080p': '1920x1080', '720p': '1280x720', '480p': '854x480', '360p': '640x360' };
+                const res2 = resMap[levelName] || '1280x720';
+                const bwMap = { '1080p': '4000000', '720p': '2000000', '480p': '1000000', '360p': '500000' };
+                const bw = bwMap[levelName] || '2000000';
+                // La playlist real ya está reescrita con rutas de proxy; la apuntamos directamente
+                const innerUrl = `/proxy?url=${encodeURIComponent(decodedUrl)}&referer=${encodeURIComponent(decodedReferer)}&forceM3u8=1`;
+                processed = [
+                    '#EXTM3U',
+                    '#EXT-X-VERSION:3',
+                    `#EXT-X-STREAM-INF:BANDWIDTH=${bw},RESOLUTION=${res2},NAME="${levelName}"`,
+                    innerUrl,
+                ].join('\n');
+                setCache(decodedUrl + '?wrap=' + levelName, processed);
+            }
+            else if (processed.includes('#EXT-X-STREAM-INF') || processed.includes('#EXT-X-MEDIA')) {
+                setCache(decodedUrl, processed);
+            }
+            sendCompressed(req, res, processed);
+        });
+    }
+    catch (err) {
+        if (!res.headersSent)
+            res.status(404).end();
+    }
+}
+// ── Envío con compresión gzip si el cliente la soporta ──
+function sendCompressed(req, res, text) {
+    const acceptEncoding = req.headers['accept-encoding'] || '';
+    if (acceptEncoding.includes('gzip')) {
+        zlib_1.default.gzip(Buffer.from(text, 'utf8'), (err, compressed) => {
+            if (err) {
+                res.end(text);
+                return;
+            }
+            res.setHeader('Content-Encoding', 'gzip');
+            res.setHeader('Content-Length', compressed.length);
+            res.end(compressed);
+        });
+    }
+    else {
+        res.end(text);
+    }
+}
+module.exports = { proxyHandler };

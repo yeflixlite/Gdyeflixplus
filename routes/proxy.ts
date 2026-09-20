@@ -5,11 +5,11 @@
  */
 
 import express from 'express';
-const { proxyVideo } = require('../controllers/proxyController');
+const { proxyHandler } = require('../controllers/proxyController');
 
 const router = express.Router();
 
 // GET /proxy?url=...&referer=...
-router.get('/', proxyVideo);
+router.get('/', proxyHandler);
 
 module.exports = router;
